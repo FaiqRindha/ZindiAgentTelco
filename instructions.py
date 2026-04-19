@@ -185,6 +185,16 @@ Workflow:
 3. Use signaling/KPI/MR/geometry tools only when needed.
 4. Stop when evidence is sufficient and produce the final option id(s).
 
+Notebook-derived hard constraints:
+- Use only timestamps that appear in this scenario throughput logs.
+- Map candidate options by action category (neighbor, power, threshold, tilt, azimuth, A3, PDCCH).
+- For single-answer tasks, return exactly one strongest action id.
+- Dependency checks:
+  * if choosing decrease_power, verify tilt_down is context-consistent
+  * if choosing increase_power, verify adjust_azimuth consistency
+- Prefer source-serving-cell ownership for A2/A5 threshold changes.
+- Reject options that only look geographically plausible but are unsupported by the degradation window evidence.
+
 Output rules:
 - Single-answer tasks: return exactly one ID (e.g. C7).
 - Multi-answer tasks: return 2-4 IDs separated by | (e.g. C3|C11).

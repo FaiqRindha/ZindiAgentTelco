@@ -3,10 +3,12 @@
 
 import argparse
 import importlib.util
+from collections import Counter
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import time
 import traceback
 from types import SimpleNamespace
@@ -223,7 +225,7 @@ class Environment:
         """
         try:
             function_name = tool_call.function.name
-            arguments = json.loads(tool_call.function.arguments or "{}")
+            arguments = self._parse_tool_arguments(tool_call.function.arguments or "{}")
             result = self._call_api(function_name=function_name, scenario_id=scenario_id, **arguments)
             return json.dumps(result, ensure_ascii=False)
 
@@ -238,6 +240,59 @@ class Environment:
             if self.verbose:
                 self.logger.error(error_msg, exc_info=True)
             return json.dumps({"error": error_msg}, ensure_ascii=False)
+
+    def _parse_tool_arguments(self, raw: str) -> Dict[str, Any]:
+        """
+        Parse tool arguments robustly.
+        If JSON is malformed, try to salvage known fields from text.
+        """
+        try:
+            parsed = json.loads(raw or "{}")
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
+
+        text = str(raw or "")
+        args: Dict[str, Any] = {}
+
+        # Common argument keys in this project.
+        str_keys = ["time", "name"]
+        int_keys = ["pci", "pci_serving", "pci_neighbor"]
+        float_keys = ["adjust_horizontal_angle", "adjust_tilt_angle"]
+
+        for k in str_keys:
+            m = re.search(rf'"{k}"\s*:\s*"([^"]+)"', text)
+            if m:
+                args[k] = m.group(1)
+
+        for k in int_keys:
+            m = re.search(rf'"{k}"\s*:\s*(-?\d+)', text)
+            if m:
+                try:
+                    args[k] = int(m.group(1))
+                except Exception:
+                    pass
+
+        for k in float_keys:
+            m = re.search(rf'"{k}"\s*:\s*(-?\d+(?:\.\d+)?)', text)
+            if m:
+                try:
+                    args[k] = float(m.group(1))
+                except Exception:
+                    pass
+
+        if self.verbose:
+            self.logger.info("[Tools API] recovered malformed args raw=%s -> %s", text, args)
+        return args
+
+    def get_throughput_logs_for_scenario(self, scenario_id: Optional[str]) -> str:
+        """
+        Helper used to seed the LLM with authoritative timestamps.
+        """
+        data = self._call_api("get_throughput_logs", scenario_id=scenario_id)
+        if isinstance(data, dict):
+            return str(data.get("Logs", "") or "")
+        return ""
 
 
 # ------------------------------------------------------------------------------
@@ -430,6 +485,7 @@ class AgentsRunner:
             "model": f"{self.model_provider}/{self.model_name}" if self.model_provider else self.model_name,
             "messages": messages,
             "max_tokens": self.max_tokens,
+            "temperature": 0.0,
             **kwargs
         }
 
@@ -567,6 +623,8 @@ class AgentsRunner:
     def run(self, scenario: Dict[str, Any], free_mode: bool = False) -> Dict[str, Any]:
         scenario_id = scenario.get("scenario_id")
         task = scenario.get("task", {})
+        desc = (task.get("description", "") or "").lower()
+        is_single = "most appropriate optimization solution" in desc
 
         root_causes = "".join([f"{item['id']}:{item['label']}\n" for item in task.get("options", [])])
 
@@ -590,6 +648,16 @@ class AgentsRunner:
             return {"scenario_id": scenario_id, "status": "unresolved", "reason": "No tools available"}
 
         question = task.get("description", "") + f"\nOptions:\n{root_causes}"
+        throughput_logs = self.environment.get_throughput_logs_for_scenario(scenario_id)
+        if throughput_logs:
+            # Seed valid timestamps from current scenario to avoid hardcoded example timestamps.
+            lines = [ln for ln in throughput_logs.splitlines() if ln.strip()]
+            snippet = "\n".join(lines[: min(14, len(lines))])
+            question += (
+                "\n\nAuthoritative throughput logs for this scenario (use timestamps from here only):\n"
+                f"{snippet}\n"
+                "Never use example timestamps from tool descriptions."
+            )
 
         messages: List[Dict[str, Any]] = []
         scenario_system_prompt = self._build_system_prompt(task)
@@ -657,8 +725,26 @@ class AgentsRunner:
             # final answer
             # elif msg.content or msg.reasoning_content:
             elif msg.content:
-                status = "solved"
-                break
+                parsed = extract_answer(msg.content) if is_single else extract_answer_all(msg.content)
+                if parsed:
+                    status = "solved"
+                    break
+                # Ask for a strict final choice if the model only gave analysis text.
+                if is_single:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "Jawab final sekarang. Output hanya satu option ID, format: C<number>.",
+                        }
+                    )
+                else:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "Jawab final sekarang. Output 2-4 option ID dipisah '|', contoh C3|C7.",
+                        }
+                    )
+                continue
 
             else:
                 status = "unresolved"
@@ -669,12 +755,18 @@ class AgentsRunner:
             status = "unresolved"
             reason = "The maximum number of iterations has been reached."
 
-        # Optional final constraint prompt once there is at least one model response.
-        if free_mode and last_msg is not None:
-            current_answer = getattr(last_msg, "content", "") or getattr(last_msg, "reasoning_content",
-                                                                         "") if last_msg else "",
+        # Optional final constraint prompt only if still unresolved.
+        if free_mode and last_msg is not None and status != "solved":
+            current_answer = (
+                (getattr(last_msg, "content", "") or getattr(last_msg, "reasoning_content", ""))
+                if last_msg else ""
+            )
             current_traces = getattr(last_msg, "reasoning_content", "") if last_msg else ""
-            agent_answer = extract_answer(current_answer) or extract_answer(current_traces)
+            agent_answer = (
+                extract_answer(current_answer) if is_single else extract_answer_all(current_answer)
+            ) or (
+                extract_answer(current_traces) if is_single else extract_answer_all(current_traces)
+            )
             if agent_answer == "":
                 self.logger.info(f"\n[Scenario: {scenario_id}] Round {i + 2} conversation, answer question:")
 
@@ -705,7 +797,11 @@ class AgentsRunner:
                     last_msg = msg2
                     if (getattr(msg2, "content", "") or getattr(msg2, "reasoning_content", "")):
                         status = "solved"
-                    final_candidate = extract_answer(getattr(msg2, "content", "") or getattr(msg2, "reasoning_content", ""))
+                    final_candidate = (
+                        extract_answer(getattr(msg2, "content", "") or getattr(msg2, "reasoning_content", ""))
+                        if is_single else
+                        extract_answer_all(getattr(msg2, "content", "") or getattr(msg2, "reasoning_content", ""))
+                    )
                 else:
                     final_candidate = ""
 
@@ -746,7 +842,9 @@ class AgentsRunner:
             save_dir: str,
             save_freq: int = 10,
             max_samples: int = None,
-            free_mode: bool = False
+            free_mode: bool = False,
+            vote_mode: str = "majority",
+            stop_after_first_valid: bool = False,
     ) -> None:
         os.makedirs(save_dir, exist_ok=True)
 
@@ -781,6 +879,9 @@ class AgentsRunner:
                         agent_answer = extract_answer(response.get("answer", "")) or extract_answer(response.get("traces", ""))
                     else:
                         agent_answer = extract_answer_all(response.get("answer", "")) or extract_answer_all(response.get("traces", ""))
+                    if not agent_answer:
+                        # Prevent false-positive solved status when no extractable final answer exists.
+                        continue
                     # if 'C' not in agent_answer:
                     #     agent_answer = 'C' + agent_answer
                     ground_truth = scenario.get("answer")
@@ -789,6 +890,8 @@ class AgentsRunner:
                     pink = "\033[95m"
                     reset = "\033[0m"
                     self.logger.info(f"{pink}\n[Scenario: {scenario_id}] Agent's answer is {agent_answer}, ground truth is {ground_truth}{reset}.")
+                    if stop_after_first_valid:
+                        break
 
             acc = n_success / float(num_attempts)
             latency = round((time.time() - start_time) / float(num_attempts), 2)
@@ -814,7 +917,11 @@ class AgentsRunner:
             save_result.append(
                 {
                     "scenario_id": scenario_id,
-                    "answers": agent_answers[0] if agent_answers else "",
+                    "answers": (
+                        Counter(agent_answers).most_common(1)[0][0]
+                        if (vote_mode == "majority" and agent_answers)
+                        else (agent_answers[0] if agent_answers else "")
+                    ),
                 }
             )
 
@@ -854,6 +961,8 @@ if __name__ == "__main__":
     parser.add_argument("--instruction_max_rules", type=int, default=3)
     parser.add_argument("--use_raw_http", action="store_true")
     parser.add_argument("--request_timeout", type=float, default=60.0)
+    parser.add_argument("--vote_mode", type=str, default="majority", choices=["majority", "first"])
+    parser.add_argument("--stop_after_first_valid", action="store_true")
     parser.add_argument("--save_dir", type=str, default="./results")
     parser.add_argument("--log_file", type=str, default="./log.log")
     parser.add_argument("--free_mode", action="store_false")
@@ -896,4 +1005,6 @@ if __name__ == "__main__":
         save_dir=args.save_dir,
         save_freq=args.save_freq,
         free_mode=args.free_mode,
+        vote_mode=args.vote_mode,
+        stop_after_first_valid=args.stop_after_first_valid,
     )
