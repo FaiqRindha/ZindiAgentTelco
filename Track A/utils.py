@@ -3,7 +3,7 @@
 
 
 from typing import Optional, Dict, Any, List
-from _types import Scenario
+from project_types import Scenario
 from logger import logging
 import json
 import re
@@ -137,6 +137,10 @@ def extract_answer(response: str):
             pred = re.sub(r"\n\s*", "", pred).lstrip(":").rstrip("./")
             pred = re.sub(r"[{}]", "", pred)
             return pred
+        # fallback: plain option id like C1, C12
+        codes = re.findall(r"\bC\d+\b", response, flags=re.IGNORECASE)
+        if codes:
+            return codes[-1].upper()
         return ""
     except:
         return ""
@@ -148,6 +152,22 @@ def extract_answer_all(response: str):
             pred = matches[-1].strip()
             pred = re.sub(r"[{}]", "", pred)
             return pred
+        # fallback 1: grouped ids like C3|C5 or C3, C5
+        groups = re.findall(
+            r"(C\d+(?:\s*(?:\||,|/|dan|and)\s*C\d+)+)",
+            response,
+            flags=re.IGNORECASE,
+        )
+        if groups:
+            grp = groups[-1].upper()
+            grp = re.sub(r"\s*(,|/|DAN|AND)\s*", "|", grp)
+            grp = re.sub(r"\s+", "", grp)
+            return grp
+
+        # fallback 2: single plain option id, prefer last mention (usually conclusion)
+        codes = re.findall(r"\bC\d+\b", response, flags=re.IGNORECASE)
+        if codes:
+            return codes[-1].upper()
         return ""
     except:
         return ""
